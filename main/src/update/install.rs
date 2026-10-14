@@ -59,6 +59,31 @@ enum PreviousInstanceExit {
     Unconfirmed,
 }
 
+/// 由 navop 在启动时**派生**出来的环境变量，只对产生它的那次运行有意义。
+///
+/// `GPUI_DISABLE_DIRECT_COMPOSITION` 不是用户配置：它由 `main()` 的 DirectComposition
+/// 闸门按 navop 自己的开关设置（见 `main.rs`），gpui 的 Windows 平台在单例构造时读一次，
+/// 新进程会在 `main()` 里重新算一遍。
+///
+/// 环境变量会被子进程继承，而自更新恰好是"父进程拉起下一代进程"：
+/// `spawn_windows_helper` 拉起新 navop 的 `--apply-update`，helper 再
+/// `restart_application` 拉起最终的 navop。于是"这一代为了自己的原因关掉合成"会变成
+/// "下一代在完全不知情的情况下也关掉了合成"——原生 RDP 的呈现静默退化为普通子窗口，
+/// 浮层被远端画面盖住，而新版本的代码里没有任何一行会做这件事。0.19.x 每次启动都
+/// **无条件**设这个变量（61ed84a4f），所以那个版本之后的所有自更新都带着这条链。
+///
+/// 因此拉起下一代 navop 之前必须剔除；新进程会按当时的 `NAVOP_*` 开关重新决定，
+/// 语义不会丢。
+const INHERITED_RUNTIME_ENVIRONMENT: &[&str] = &["GPUI_DISABLE_DIRECT_COMPOSITION"];
+
+/// 剔除只属于当前这次运行的环境变量，再交给 `spawn`。
+fn without_inherited_runtime_environment(mut command: Command) -> Command {
+    for name in INHERITED_RUNTIME_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    command
+}
+
 pub(crate) fn start_install_update(download_path: PathBuf) -> Result<UpdateInstallAction, String> {
     if one_core::app_paths::is_portable() {
         return Err("便携模式不支持应用内安装更新，请下载新的便携版并保留 data 目录".to_string());
@@ -144,7 +169,7 @@ fn spawn_windows_helper(staging_dir: &Path) -> Result<(), String> {
     let target_path =
         std::env::current_exe().map_err(|err| format!("获取当前路径失败: {}", err))?;
 
-    Command::new(&source_path)
+    without_inherited_runtime_environment(Command::new(&source_path))
         .arg(super::APPLY_UPDATE_FLAG)
         .arg(&source_path)
         .arg(&target_path)
@@ -342,7 +367,7 @@ fn install_macos(staging_dir: &Path) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn restart_macos_application(app_path: &Path) -> Result<(), String> {
-    Command::new("/usr/bin/open")
+    without_inherited_runtime_environment(Command::new("/usr/bin/open"))
         .arg("-n")
         .arg(app_path)
         .spawn()
@@ -612,7 +637,7 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
 }
 
 fn restart_application(target_path: &Path) -> Result<(), String> {
-    Command::new(target_path)
+    without_inherited_runtime_environment(Command::new(target_path))
         .spawn()
         .map_err(|err| format!("重启应用失败: {}", err))?;
     Ok(())
@@ -641,7 +666,29 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{replace_target_with_backup, start_install_update};
+    use super::{
+        replace_target_with_backup, start_install_update, without_inherited_runtime_environment,
+    };
+
+    /// 下一代 navop 不能继承上一代的 `GPUI_DISABLE_DIRECT_COMPOSITION`。
+    ///
+    /// 回归点：0.19.x 每次启动都无条件设它（`61ed84a4f`），自更新又恰好是"父进程拉起
+    /// 下一代进程"，于是新版本会在代码默认启用合成的同时把合成关掉——原生 RDP 静默
+    /// 退化为普通子窗口。新进程会按当时的 `NAVOP_*` 开关重新算，所以剔除不丢语义。
+    #[test]
+    fn relaunching_navop_strips_the_derived_direct_composition_switch() {
+        let mut command = std::process::Command::new("navop");
+        command.env("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+
+        let command = without_inherited_runtime_environment(command);
+
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == "GPUI_DISABLE_DIRECT_COMPOSITION" && value.is_none()),
+            "an inherited GPUI DirectComposition opt-out must not reach the next generation"
+        );
+    }
 
     #[test]
     fn start_install_update_rejects_missing_archive_before_staging() {

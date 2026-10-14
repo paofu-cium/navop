@@ -364,18 +364,40 @@ fn main() {
     // 过早 cloak 会让合成 surface 永久为空、RDP 区域只剩 gpui 背景色 `#171717`。
     // 见 `docs/windows-native-rdp-cloak-ordering.md`。
     //
-    // `NAVOP_RDP_DISABLE_COMPOSITION=1` 是逃生门：直接关掉整条合成路径（同时关掉
-    // GPUI 的 DirectComposition），退回经典 HWND 子窗口。该环境变量只在 platform
-    // 单例构造时读取一次，所以必须在这里、在 GPUI 之前决定；使用共享编译期标记
-    // （`remote_desktop_view/windows-native-rdp` 也会启用它）而不是 main 自身的
-    // feature，保证两种 feature 写法都生效。
-    if remote_desktop::windows_native_rdp_compiled()
-        && std::env::var_os("NAVOP_RDP_DISABLE_COMPOSITION").is_some()
-    {
+    // 合成开关的**唯一权威**是 navop 自己的两个变量：
+    //
+    // * `NAVOP_RDP_DISABLE_COMPOSITION`    —— 逃生门：关掉原生 RDP 的合成呈现，退回
+    //   经典 HWND 子窗口。此时必须**连带**关掉 GPUI 的 DirectComposition，否则 RDP
+    //   只是个普通子窗口，会被 GPUI 的合成 visual 盖住。
+    // * `NAVOP_DISABLE_DIRECT_COMPOSITION` —— 显式要求全局关掉 GPUI 的
+    //   DirectComposition（给需要绕开 DComp 本身的渲染问题的用户）。
+    //
+    // `GPUI_DISABLE_DIRECT_COMPOSITION` 本身是 **GPUI 的内部调试旋钮**，不是 navop 的
+    // 对外接口，所以这里由 navop 拍板、不让环境里的残留值说话：上面两个开关都没开，
+    // 就**清掉**继承来的那个值。
+    //
+    // 这一条不是洁癖。0.19.x 每次启动都无条件设它（61ed84a4f），而自更新是"父进程
+    // 拉起下一代进程"（`spawn_windows_helper` → 新 navop 的 `--apply-update` →
+    // `restart_application`），环境变量会被子进程继承 —— 于是从那个版本升上来的 navop
+    // 会在**代码默认启用合成**的同时把合成关掉：原生 RDP 退回普通子窗口，浮层被远端
+    // 画面盖住，而日志里只剩一句来自 gpui 的 "DirectComposition is disabled"，
+    // 谁都不知道该去查什么。清掉它，"默认启用"才是真的。
+    //
+    // 该环境变量只在 platform 单例构造时读取一次，所以必须在这里、在 GPUI 之前决定；
+    // 使用共享编译期标记（`remote_desktop_view/windows-native-rdp` 也会启用它）而不是
+    // main 自身的 feature，保证两种 feature 写法都生效。
+    if remote_desktop::windows_native_rdp_compiled() {
+        let escape_hatch = std::env::var_os("NAVOP_RDP_DISABLE_COMPOSITION").is_some();
+        let global_opt_out = std::env::var("NAVOP_DISABLE_DIRECT_COMPOSITION")
+            .is_ok_and(|value| value == "1" || value == "true");
         // SAFETY: 进程尚未创建 GPUI platform，也没有任何线程会读取该
         // 环境变量；与 smoke 工具在进程首部执行相同操作。
         unsafe {
-            std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+            if escape_hatch || global_opt_out {
+                std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+            } else {
+                std::env::remove_var("GPUI_DISABLE_DIRECT_COMPOSITION");
+            }
         }
     }
 
@@ -773,6 +795,17 @@ mod embedded_cli_removal_tests {
         assert!(
             !source.contains("NAVOP_RDP_ENABLE_COMPOSITION"),
             "the retired opt-in switch must not survive as a no-op"
+        );
+        // 继承来的值必须被清掉，而不是被当成用户意愿照办。
+        //
+        // 回归点：0.19.x 每次启动都无条件设 `GPUI_DISABLE_DIRECT_COMPOSITION`
+        // （`61ed84a4f`），自更新又通过 `Command::new` 拉起下一代进程，环境变量被继承；
+        // 不清掉的话，新版本会在"默认启用合成"的代码上把合成关掉——原生 RDP 退回普通
+        // 子窗口，浮层被远端画面盖住，而日志里只剩一句 gpui 的
+        // "DirectComposition is disabled"。显式关闭只能走 `NAVOP_*` 开关。
+        assert!(
+            source.contains("std::env::remove_var(\"GPUI_DISABLE_DIRECT_COMPOSITION\")"),
+            "an inherited GPUI DirectComposition opt-out must be cleared"
         );
     }
 
